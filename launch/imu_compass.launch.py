@@ -34,6 +34,23 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+import os
+import yaml
+from ament_index_python.packages import get_package_share_directory
+
+
+def _petaar26(filename: str) -> dict:
+    """Load a petaar26 config YAML from the installed share directory."""
+    path = os.path.join(
+        get_package_share_directory('petaar26'),
+        'config', filename
+    )
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+_topics = _petaar26('topics.yaml')['topics']
+_hw     = _petaar26('hardware.yaml')['hardware']
 
 
 def generate_launch_description():
@@ -44,6 +61,33 @@ def generate_launch_description():
     robot_name_arg = DeclareLaunchArgument(
         "robot_name",
         description="Robot namespace (e.g. warthog1)."
+    )
+
+    # GPS topic suffix — selects between GeoFog and u-blox hardware.
+    # The node subscribes to /{robot_name}/{gps_topic_suffix} for calibration bearings.
+    # Default matches the historical hardcoded value so existing configs work.
+    # sim_control.py passes the active profile's gps_topic_suffix here.
+    gps_topic_suffix_arg = DeclareLaunchArgument(
+        "gps_topic_suffix",
+        default_value=_hw['gps_topic_suffix'],
+        description=(
+            "GPS topic path suffix within the robot namespace. "
+            "Node subscribes to /{robot_name}/{gps_topic_suffix} for calibration. "
+            "Options: sensors/geofog/gps/fix (GeoFog, NAI_2) "
+            "or sensors/ublox/fix (u-blox, NAI_3/NAI_4). "
+            "Driven by gps_topic_suffix in the active profile (profiles.json)."
+        )
+    )
+
+    # IMU topic suffix — deployment-specific driver path.
+    imu_topic_suffix_arg = DeclareLaunchArgument(
+        "imu_topic_suffix",
+        default_value=_hw['imu_topic_suffix'],
+        description=(
+            "IMU topic path suffix within the robot namespace. "
+            "Node subscribes to /{robot_name}/{imu_topic_suffix}. "
+            "Default from config/topics.yaml → topics.imu_raw."
+        )
     )
 
     min_speed_arg = DeclareLaunchArgument(
@@ -98,6 +142,8 @@ def generate_launch_description():
         namespace=LaunchConfiguration("robot_name"),
         parameters=[{
             "robot_name":                     LaunchConfiguration("robot_name"),
+            "gps_topic_suffix":               LaunchConfiguration("gps_topic_suffix"),
+            "imu_topic_suffix":               LaunchConfiguration("imu_topic_suffix"),
             "min_calibration_speed_m_s":      LaunchConfiguration("min_calibration_speed_m_s"),
             "max_calibration_yaw_rate_rad_s": LaunchConfiguration("max_calibration_yaw_rate_rad_s"),
             "min_gps_heading_distance_m":     LaunchConfiguration("min_gps_heading_distance_m"),
@@ -110,6 +156,8 @@ def generate_launch_description():
 
     return LaunchDescription([
         robot_name_arg,
+        gps_topic_suffix_arg,
+        imu_topic_suffix_arg,
         min_speed_arg,
         max_yaw_rate_arg,
         min_distance_arg,

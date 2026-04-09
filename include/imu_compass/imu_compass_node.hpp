@@ -50,15 +50,22 @@
 //   4. Sufficient time and distance since the last GPS sample used for heading
 //
 // SUBSCRIBES:
-//   /{robot_name}/sensors/microstrain/ekf/imu/data   [sensor_msgs/msg/Imu]
+//   /{robot_name}/{imu_topic_suffix}                 [sensor_msgs/msg/Imu]
 //       Quaternion orientation → extract ENU yaw → convert to compass heading.
 //       Also angular_velocity.z for the calibration yaw rate gate.
+//       Topic suffix driven by 'imu_topic_suffix' parameter.
+//       Default: "sensors/microstrain/ekf/imu/data".
 //
-//   /{robot_name}/sensors/ublox/fix                  [sensor_msgs/msg/NavSatFix]
-//       Successive fixes → GPS bearing. Only used when calibration conditions met.
+//   /{robot_name}/{gps_topic_suffix}                 [sensor_msgs/msg/NavSatFix]
+//       Successive fixes → GPS bearing for calibration.
+//       Only used when calibration conditions are met.
+//       Topic suffix driven by 'gps_topic_suffix' parameter so this node
+//       works with both GeoFog and u-blox hardware variants without recompilation.
+//       Default: "sensors/geofog/gps/fix".
 //
 //   /{robot_name}/gps_speed                          [std_msgs/msg/Float64]
-//       Pre-computed ground speed. Gate: only calibrate when >= threshold.
+//       Pre-computed ground speed from gps_speed_node.
+//       Gate: only calibrate when speed >= min_calibration_speed_m_s.
 //
 // PUBLISHES:
 //   /{robot_name}/compass         [std_msgs/msg/Float64]
@@ -75,6 +82,16 @@
 //   robot_name                      (string, required)
 //       Robot namespace, e.g. "warthog1".
 //
+//   gps_topic_suffix                (string, "sensors/geofog/gps/fix")
+//       GPS topic path after /{robot_name}/. Set to "sensors/geofog/gps/fix"
+//       for GeoFog hardware (NAI_2, testing) or "sensors/ublox/fix" for
+//       u-blox (NAI_3, NAI_4). Driven by the active profile's gps_topic_suffix
+//       in petaar26/experiment/profiles.json.
+//
+//   imu_topic_suffix                (string, "sensors/microstrain/ekf/imu/data")
+//       IMU topic path after /{robot_name}/. Change if your IMU driver
+//       publishes to a different topic.
+//
 //   min_calibration_speed_m_s       (double, 1.0)
 //       Minimum gps_speed to allow calibration update.
 //
@@ -89,9 +106,15 @@
 //       Minimum time between GPS fixes used for bearing computation.
 //
 //   calibration_ema_alpha           (double, 0.5)
-//       EMA weight for calibration offset smoothing. 1.0 = no smoothing
-//       (each GPS bearing immediately replaces the offset). 0.3 = strong
-//       smoothing. Reduces impact of GPS multipath / noisy bearing samples.
+//       EMA smoothing weight for calibration offset updates.
+//       new_offset = prev + alpha * normalize_180(new_sample - prev)
+//       Angular delta arithmetic avoids ±180° wrap artefacts.
+//       1.0 = instant update (no smoothing, original pre-fix behaviour).
+//       0.5 = equal weight to new sample and history (default).
+//       0.3 = strong smoothing — slow to converge, very noise-resistant.
+//       NOTE: This parameter was exposed in the launch file but was previously
+//       not read or applied in the node (offset was replaced wholesale, i.e.
+//       effectively alpha=1.0). EMA is now correctly implemented in the .cpp.
 //
 // LAUNCH EXAMPLE:
 //   ros2 launch imu_compass imu_compass.launch.py robot_name:=warthog1

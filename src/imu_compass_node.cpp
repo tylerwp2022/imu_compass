@@ -39,10 +39,39 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
     this->declare_parameter<double>("min_gps_heading_distance_m",      0.5);
     this->declare_parameter<double>("gps_heading_min_time_delta_s",    0.1);
 
+    // EMA smoothing weight for calibration offset updates.
+    // WHY THIS WAS MISSING: calibration_ema_alpha_ was declared in the header
+    // and exposed in the launch file but never actually read or applied in the
+    // .cpp — the offset was replaced wholesale each update (equivalent to
+    // alpha=1.0, no smoothing). Fixed below in the GPS callback.
+    // 1.0 = instant update (no smoothing), 0.3 = strong smoothing.
+    this->declare_parameter<double>("calibration_ema_alpha", 0.5);
+
+    // Topic suffix parameters.
+    // WHY PARAMETERS AND NOT HARDCODED:
+    //   The PETAAR study deploys two GPS hardware variants across conditions:
+    //     - GeoFog GNSS  → "sensors/geofog/gps/fix"  (NAI_2, testing profiles)
+    //     - u-blox GNSS  → "sensors/ublox/fix"        (NAI_3, NAI_4 profiles)
+    //   The active suffix is selected per-profile in petaar26/experiment/profiles.json
+    //   and passed here by imu_compass.launch.py. Hardcoding either suffix would
+    //   cause this node to subscribe to the wrong GPS topic and never calibrate
+    //   on the other hardware variant.
+    //
+    //   The IMU path is also deployment-specific, parameterised for the same reason.
+    //   Both default to the historical hardcoded strings so existing launch
+    //   configurations that do not pass them continue to work unchanged.
+    this->declare_parameter<std::string>("gps_topic_suffix",
+        "sensors/geofog/gps/fix");
+    this->declare_parameter<std::string>("imu_topic_suffix",
+        "sensors/microstrain/ekf/imu/data");
+
     min_calibration_speed_m_s_      = this->get_parameter("min_calibration_speed_m_s").as_double();
     max_calibration_yaw_rate_rad_s_ = this->get_parameter("max_calibration_yaw_rate_rad_s").as_double();
     min_gps_heading_distance_m_     = this->get_parameter("min_gps_heading_distance_m").as_double();
     gps_heading_min_time_delta_s_   = this->get_parameter("gps_heading_min_time_delta_s").as_double();
+    calibration_ema_alpha_          = this->get_parameter("calibration_ema_alpha").as_double();
+    const std::string gps_topic_suffix = this->get_parameter("gps_topic_suffix").as_string();
+    const std::string imu_topic_suffix = this->get_parameter("imu_topic_suffix").as_string();
 
     RCLCPP_INFO(this->get_logger(),
         "Parameters: robot_name=%s  min_cal_speed=%.2fm/s  "
@@ -56,10 +85,14 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
         gps_heading_min_time_delta_s_);
 
     //--------------------------------------------------------------------------
-    // Build topic names
+    // Build topic names from parameters
+    // WHY ABSOLUTE PATHS (leading slash):
+    //   This node is launched WITHOUT a ROS2 namespace. Absolute topic paths
+    //   ensure subscribers reach the correct namespaced topics regardless of
+    //   any executor-level namespace settings.
     //--------------------------------------------------------------------------
-    const std::string imu_topic     = "/" + robot_name_ + "/sensors/microstrain/ekf/imu/data";
-    const std::string gps_topic     = "/" + robot_name_ + "/sensors/geofog/gps/fix";
+    const std::string imu_topic     = "/" + robot_name_ + "/" + imu_topic_suffix;
+    const std::string gps_topic     = "/" + robot_name_ + "/" + gps_topic_suffix;
     const std::string speed_topic   = "/" + robot_name_ + "/gps_speed";
     const std::string compass_topic = "/" + robot_name_ + "/compass";
     const std::string status_topic  = "/" + robot_name_ + "/compass/status";
@@ -278,8 +311,40 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
     const double imu_compass_deg = latest_imu_compass_deg_.load();
     const double new_offset  = normalize_180(gps_heading_deg - imu_compass_deg);
 
+    //--------------------------------------------------------------------------
+    // Update calibration offset via EMA smoothing.
+    //
+    // WHY EMA AND NOT DIRECT REPLACEMENT:
+    //   A single GPS bearing sample can be corrupted by multipath, antenna
+    //   vibration, or a momentary non-straight heading. EMA rejects outliers
+    //   by weighting the new sample against the running estimate:
+    //     new_offset = alpha * new_sample + (1 - alpha) * previous_offset
+    //   alpha=1.0 → instant update (original behavior, no smoothing).
+    //   alpha=0.5 → equal weight to new sample and history (default).
+    //   alpha=0.3 → strong smoothing; slow to converge, very noise-resistant.
+    //
+    // WHY NORMALIZE THE ANGULAR MEAN:
+    //   The offset lives in [-180, 180]. A direct weighted sum of two angles
+    //   near ±180° would wrap incorrectly (e.g. -179° and +179° should average
+    //   to ±180°, not 0°). We handle this by computing the delta between the
+    //   new and old estimate and adding a fraction of it, which is equivalent
+    //   to EMA but stays on the correct side of the ±180° boundary.
+    //--------------------------------------------------------------------------
     const bool first_calibration = !calibration_offset_deg_.has_value();
-    calibration_offset_deg_ = new_offset;
+
+    if (first_calibration)
+    {
+        // Bootstrap: no history to blend with, accept new_offset directly.
+        calibration_offset_deg_ = new_offset;
+    }
+    else
+    {
+        // EMA step using angular delta to avoid ±180° wrap artefacts.
+        const double prev_offset = calibration_offset_deg_.value();
+        const double delta       = normalize_180(new_offset - prev_offset);
+        calibration_offset_deg_  = normalize_180(
+            prev_offset + calibration_ema_alpha_ * delta);
+    }
 
     // Build a human-readable UTC timestamp for the status topic.
     // Format: "Calibrated - Last update: 2024-03-15 14:23:07 UTC"
