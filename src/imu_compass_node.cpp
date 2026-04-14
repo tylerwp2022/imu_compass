@@ -34,32 +34,24 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
         throw std::runtime_error("Missing required parameter: robot_name");
     }
 
+    // use_status_speed: when true (default), subscribe to the hardware odometry
+    // speed topic and use it as the primary calibration gate. Falls back to
+    // gps_speed if status_speed hasn't published yet. See header for full rationale.
+    this->declare_parameter<bool>("use_status_speed", true);
+    use_status_speed_ = this->get_parameter("use_status_speed").as_bool();
+
+    // status_speed topic suffix — the segment after /{robot_name}/
+    this->declare_parameter<std::string>("status_speed_topic_suffix", "status_speed");
+    const std::string status_speed_suffix =
+        this->get_parameter("status_speed_topic_suffix").as_string();
+
     this->declare_parameter<double>("min_calibration_speed_m_s",       1.0);
     this->declare_parameter<double>("max_calibration_yaw_rate_rad_s",  0.1);
     this->declare_parameter<double>("min_gps_heading_distance_m",      0.5);
     this->declare_parameter<double>("gps_heading_min_time_delta_s",    0.1);
+    this->declare_parameter<double>("calibration_ema_alpha",           0.5);
 
-    // EMA smoothing weight for calibration offset updates.
-    // WHY THIS WAS MISSING: calibration_ema_alpha_ was declared in the header
-    // and exposed in the launch file but never actually read or applied in the
-    // .cpp — the offset was replaced wholesale each update (equivalent to
-    // alpha=1.0, no smoothing). Fixed below in the GPS callback.
-    // 1.0 = instant update (no smoothing), 0.3 = strong smoothing.
-    this->declare_parameter<double>("calibration_ema_alpha", 0.5);
-
-    // Topic suffix parameters.
-    // WHY PARAMETERS AND NOT HARDCODED:
-    //   The PETAAR study deploys two GPS hardware variants across conditions:
-    //     - GeoFog GNSS  → "sensors/geofog/gps/fix"  (NAI_2, testing profiles)
-    //     - u-blox GNSS  → "sensors/ublox/fix"        (NAI_3, NAI_4 profiles)
-    //   The active suffix is selected per-profile in petaar26/experiment/profiles.json
-    //   and passed here by imu_compass.launch.py. Hardcoding either suffix would
-    //   cause this node to subscribe to the wrong GPS topic and never calibrate
-    //   on the other hardware variant.
-    //
-    //   The IMU path is also deployment-specific, parameterised for the same reason.
-    //   Both default to the historical hardcoded strings so existing launch
-    //   configurations that do not pass them continue to work unchanged.
+    // Topic suffix parameters — see header for rationale.
     this->declare_parameter<std::string>("gps_topic_suffix",
         "sensors/geofog/gps/fix");
     this->declare_parameter<std::string>("imu_topic_suffix",
@@ -76,26 +68,29 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
     RCLCPP_INFO(this->get_logger(),
         "Parameters: robot_name=%s  min_cal_speed=%.2fm/s  "
         "max_cal_yaw_rate=%.3frad/s (%.1fdeg/s)  "
-        "min_gps_distance=%.2fm  min_gps_time_delta=%.3fs",
+        "min_gps_distance=%.2fm  min_gps_time_delta=%.3fs  "
+        "ema_alpha=%.2f  use_status_speed=%s",
         robot_name_.c_str(),
         min_calibration_speed_m_s_,
         max_calibration_yaw_rate_rad_s_,
         rad2deg(max_calibration_yaw_rate_rad_s_),
         min_gps_heading_distance_m_,
-        gps_heading_min_time_delta_s_);
+        gps_heading_min_time_delta_s_,
+        calibration_ema_alpha_,
+        use_status_speed_ ? "true" : "false");
 
     //--------------------------------------------------------------------------
-    // Build topic names from parameters
-    // WHY ABSOLUTE PATHS (leading slash):
-    //   This node is launched WITHOUT a ROS2 namespace. Absolute topic paths
-    //   ensure subscribers reach the correct namespaced topics regardless of
-    //   any executor-level namespace settings.
+    // Build topic names
+    // WHY ABSOLUTE PATHS (leading slash): this node is launched under the
+    // robot namespace, so relative topics would double-prefix. Absolute paths
+    // are explicit and immune to executor-level namespace surprises.
     //--------------------------------------------------------------------------
-    const std::string imu_topic     = "/" + robot_name_ + "/" + imu_topic_suffix;
-    const std::string gps_topic     = "/" + robot_name_ + "/" + gps_topic_suffix;
-    const std::string speed_topic   = "/" + robot_name_ + "/gps_speed";
-    const std::string compass_topic = "/" + robot_name_ + "/compass";
-    const std::string status_topic  = "/" + robot_name_ + "/compass/status";
+    const std::string imu_topic          = "/" + robot_name_ + "/" + imu_topic_suffix;
+    const std::string gps_topic          = "/" + robot_name_ + "/" + gps_topic_suffix;
+    const std::string gps_speed_topic    = "/" + robot_name_ + "/sensors/gps_speed";
+    const std::string status_speed_topic = "/" + robot_name_ + "/" + status_speed_suffix;
+    const std::string compass_topic      = "/" + robot_name_ + "/compass";
+    const std::string status_topic       = "/" + robot_name_ + "/compass/status";
 
     //--------------------------------------------------------------------------
     // Subscribers
@@ -117,13 +112,34 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
             this->gps_callback(msg);
         });
 
-    // gps_speed: ~9 Hz. Pre-computed by gps_speed_node.
-    speed_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-        speed_topic,
+    // gps_speed: ~9 Hz. Always subscribed — either used as the primary gate
+    // (use_status_speed=false) or as the startup fallback (use_status_speed=true).
+    gps_speed_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+        gps_speed_topic,
         rclcpp::SensorDataQoS(),
         [this](std_msgs::msg::Float64::SharedPtr msg) {
-            this->speed_callback(msg);
+            this->gps_speed_callback(msg);
         });
+
+    // status_speed: only subscribed when use_status_speed=true.
+    // WHY CONDITIONAL SUBSCRIPTION: if use_status_speed=false the user has
+    // explicitly opted into the legacy gps_speed-only path. Creating the
+    // subscription anyway would add noise to ros2 topic info output and could
+    // cause confusion if the topic doesn't exist on the platform.
+    if (use_status_speed_)
+    {
+        // Use SensorDataQoS (best-effort) so this works whether the platform
+        // publishes with best-effort or reliable — ROS2 will match on the
+        // publisher's QoS. If status_speed is published reliable, a
+        // best-effort subscriber will still connect and receive all messages
+        // on a lossless local network (loopback / shared memory).
+        status_speed_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+            status_speed_topic,
+            rclcpp::SensorDataQoS(),
+            [this](std_msgs::msg::Float64::SharedPtr msg) {
+                this->status_speed_callback(msg);
+            });
+    }
 
     //--------------------------------------------------------------------------
     // Publishers
@@ -134,23 +150,97 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
     status_pub_ = this->create_publisher<std_msgs::msg::String>(
         status_topic, rclcpp::QoS(10).reliable());
 
-    RCLCPP_INFO(this->get_logger(), "Subscribed to IMU:      %s", imu_topic.c_str());
-    RCLCPP_INFO(this->get_logger(), "Subscribed to GPS:      %s", gps_topic.c_str());
-    RCLCPP_INFO(this->get_logger(), "Subscribed to speed:    %s", speed_topic.c_str());
-    RCLCPP_INFO(this->get_logger(), "Publishing compass:     %s", compass_topic.c_str());
-    RCLCPP_INFO(this->get_logger(), "Publishing status:      %s", status_topic.c_str());
+    //--------------------------------------------------------------------------
+    // Startup log — make the active configuration immediately visible
+    //--------------------------------------------------------------------------
+    RCLCPP_INFO(this->get_logger(), "Subscribed to IMU:       %s", imu_topic.c_str());
+    RCLCPP_INFO(this->get_logger(), "Subscribed to GPS:       %s", gps_topic.c_str());
+    RCLCPP_INFO(this->get_logger(), "Subscribed to gps_speed: %s", gps_speed_topic.c_str());
+
+    if (use_status_speed_)
+    {
+        RCLCPP_INFO(this->get_logger(),
+            "Subscribed to status_speed: %s  (preferred speed gate — "
+            "will fall back to gps_speed until first message arrives)",
+            status_speed_topic.c_str());
+    }
+    else
+    {
+        RCLCPP_WARN(this->get_logger(),
+            "use_status_speed=false — using gps_speed as calibration gate. "
+            "GPS noise at standstill may cause false calibration updates. "
+            "Set use_status_speed:=true if the platform publishes %s.",
+            status_speed_topic.c_str());
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Publishing compass:      %s", compass_topic.c_str());
+    RCLCPP_INFO(this->get_logger(), "Publishing status:       %s", status_topic.c_str());
     RCLCPP_INFO(this->get_logger(),
-        "Status: UNCALIBRATED — move at >= %.1f m/s to calibrate.",
+        "Status: UNCALIBRATED — move at >= %.2f m/s to calibrate.",
         min_calibration_speed_m_s_);
 }
 
 //==============================================================================
-// SPEED CALLBACK — just cache it
+// SPEED GATE HELPER
 //==============================================================================
 
-void ImuCompassNode::speed_callback(const std_msgs::msg::Float64::SharedPtr msg)
+double ImuCompassNode::effective_speed_m_s() const
 {
-    latest_speed_m_s_.store(msg->data);
+    if (!use_status_speed_)
+    {
+        // Legacy mode: always use gps_speed.
+        return latest_gps_speed_m_s_.load();
+    }
+
+    if (status_speed_received_.load())
+    {
+        // Preferred path: odometry is available and noise-free at standstill.
+        return latest_status_speed_m_s_.load();
+    }
+
+    // Fallback: use_status_speed=true but no status_speed message yet.
+    // This happens at startup, or if the platform doesn't publish the topic.
+    // The warning is throttled to avoid log spam; it fires at most once per 10s.
+    // Once status_speed_received_ flips true, this branch is never taken again.
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+        "use_status_speed=true but no status_speed message received yet — "
+        "falling back to gps_speed for calibration gate. "
+        "Check that the status_speed topic is publishing. "
+        "This warning disappears once the first message arrives.");
+
+    return latest_gps_speed_m_s_.load();
+}
+
+//==============================================================================
+// GPS SPEED CALLBACK — cache GPS-derived speed
+//==============================================================================
+
+void ImuCompassNode::gps_speed_callback(const std_msgs::msg::Float64::SharedPtr msg)
+{
+    latest_gps_speed_m_s_.store(msg->data);
+}
+
+//==============================================================================
+// STATUS SPEED CALLBACK — cache hardware odometry speed
+//==============================================================================
+
+void ImuCompassNode::status_speed_callback(const std_msgs::msg::Float64::SharedPtr msg)
+{
+    const bool was_received = status_speed_received_.load();
+
+    latest_status_speed_m_s_.store(msg->data);
+
+    // Flip the received flag on the first message. Log once so the operator
+    // can confirm the switch from fallback mode happened as expected.
+    if (!was_received)
+    {
+        status_speed_received_.store(true);
+        RCLCPP_INFO(this->get_logger(),
+            "status_speed topic is live (first message: %.4f m/s). "
+            "Calibration gate is now using hardware odometry — "
+            "GPS noise at standstill will no longer trigger false calibrations.",
+            msg->data);
+    }
 }
 
 //==============================================================================
@@ -178,8 +268,6 @@ void ImuCompassNode::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
     // /compass        — Float64: calibrated heading [0, 360), or -1.0 if not
     //                   yet calibrated. Always published at IMU rate.
     // /compass/status — String: human-readable calibration state.
-    //                   Uncalibrated: "UNCALIBRATED - Begin moving to calibrate"
-    //                   Calibrated:   "Calibrated - Last update: 2024-03-15 14:23:07 UTC"
     //--------------------------------------------------------------------------
     auto hdg_msg = std_msgs::msg::Float64();
     auto status_msg = std_msgs::msg::String();
@@ -217,34 +305,45 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
     }
 
     //--------------------------------------------------------------------------
-    // Gate 2: Speed sufficient for reliable GPS heading
+    // Gate 2: Speed sufficient for reliable GPS heading.
+    //
+    // effective_speed_m_s() selects the best available speed signal:
+    //   - status_speed (odometry) if use_status_speed=true and topic is live
+    //   - gps_speed otherwise (with a logged fallback warning)
+    //
+    // WHY RESET ANCHOR ON LOW SPEED:
+    //   If the robot slows below threshold, discard the GPS anchor accumulated
+    //   during motion. We don't want the next calibration sample to span a
+    //   stop-and-go event — the bearing between a pre-stop and post-stop fix
+    //   is meaningless (it points from wherever the robot stopped to wherever
+    //   it resumed, which has nothing to do with the robot's current heading).
     //--------------------------------------------------------------------------
-    const double speed = latest_speed_m_s_.load();
+    const double speed = effective_speed_m_s();
+
+    const char * speed_source =
+        (use_status_speed_ && status_speed_received_.load()) ? "status_speed" : "gps_speed";
 
     if (speed < min_calibration_speed_m_s_)
     {
-        // Not moving fast enough — reset GPS anchor so we start fresh when
-        // the robot picks up speed, rather than using a stale pre-stop position.
         prev_gps_sample_.reset();
 
         RCLCPP_DEBUG(this->get_logger(),
-            "Speed %.2f m/s < threshold %.2f m/s — resetting GPS anchor.",
-            speed, min_calibration_speed_m_s_);
+            "[%s] Speed %.3f m/s < threshold %.3f m/s — resetting GPS anchor.",
+            speed_source, speed, min_calibration_speed_m_s_);
         return;
     }
 
     //--------------------------------------------------------------------------
     // Gate 3: Low yaw rate (straight-ish movement)
-    // WHY stricter than the gps_speed rotation gate: GPS bearing on a curved
+    // WHY stricter than gps_speed's rotation gate: GPS bearing on a curved
     // arc doesn't match the robot's instantaneous heading, so we'd compute
-    // a wrong calibration offset.
+    // a wrong calibration offset. Requiring low yaw rate ensures we only
+    // calibrate during straight-line travel.
     //--------------------------------------------------------------------------
     const double yaw_rate = std::abs(latest_yaw_rate_rad_s_.load());
 
     if (yaw_rate > max_calibration_yaw_rate_rad_s_)
     {
-        // Robot is turning — reset GPS anchor so bearing is computed between
-        // two points both taken during straight-line travel.
         prev_gps_sample_.reset();
 
         RCLCPP_DEBUG(this->get_logger(),
@@ -262,7 +361,9 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
     if (!prev_gps_sample_.has_value())
     {
         prev_gps_sample_ = {msg->latitude, msg->longitude, current_stamp};
-        RCLCPP_DEBUG(this->get_logger(), "GPS anchor set for heading computation.");
+        RCLCPP_DEBUG(this->get_logger(),
+            "GPS anchor set for heading computation [speed_source=%s, speed=%.3f m/s].",
+            speed_source, speed);
         return;
     }
 
@@ -291,7 +392,7 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
         RCLCPP_DEBUG(this->get_logger(),
             "GPS displacement %.4fm < %.4fm — not enough for reliable bearing.",
             distance_m, min_gps_heading_distance_m_);
-        // Don't reset anchor — keep accumulating distance
+        // Don't reset anchor — keep accumulating distance.
         return;
     }
 
@@ -317,18 +418,16 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
     // WHY EMA AND NOT DIRECT REPLACEMENT:
     //   A single GPS bearing sample can be corrupted by multipath, antenna
     //   vibration, or a momentary non-straight heading. EMA rejects outliers
-    //   by weighting the new sample against the running estimate:
-    //     new_offset = alpha * new_sample + (1 - alpha) * previous_offset
-    //   alpha=1.0 → instant update (original behavior, no smoothing).
+    //   by weighting the new sample against the running estimate.
+    //   alpha=1.0 → instant update (no smoothing).
     //   alpha=0.5 → equal weight to new sample and history (default).
     //   alpha=0.3 → strong smoothing; slow to converge, very noise-resistant.
     //
     // WHY NORMALIZE THE ANGULAR MEAN:
     //   The offset lives in [-180, 180]. A direct weighted sum of two angles
-    //   near ±180° would wrap incorrectly (e.g. -179° and +179° should average
-    //   to ±180°, not 0°). We handle this by computing the delta between the
-    //   new and old estimate and adding a fraction of it, which is equivalent
-    //   to EMA but stays on the correct side of the ±180° boundary.
+    //   near ±180° would wrap incorrectly. We compute the delta between old and
+    //   new estimate and add a fraction of it — equivalent to EMA but correct
+    //   across the ±180° boundary.
     //--------------------------------------------------------------------------
     const bool first_calibration = !calibration_offset_deg_.has_value();
 
@@ -339,7 +438,6 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
     }
     else
     {
-        // EMA step using angular delta to avoid ±180° wrap artefacts.
         const double prev_offset = calibration_offset_deg_.value();
         const double delta       = normalize_180(new_offset - prev_offset);
         calibration_offset_deg_  = normalize_180(
@@ -347,34 +445,37 @@ void ImuCompassNode::gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr m
     }
 
     // Build a human-readable UTC timestamp for the status topic.
-    // Format: "Calibrated - Last update: 2024-03-15 14:23:07 UTC"
+    // Include which speed source was active so the operator can verify.
+    // Format: "Calibrated [status_speed] - Last update: 2024-03-15 14:23:07 UTC"
     {
         const std::time_t now_t = std::time(nullptr);
-        char time_buf[64];
-        std::strftime(time_buf, sizeof(time_buf),
-            "Calibrated - Last update: %Y-%m-%d %H:%M:%S UTC",
-            std::gmtime(&now_t));
-        last_calibration_time_str_ = time_buf;
+        char time_buf[80];
+        std::snprintf(time_buf, sizeof(time_buf),
+            "Calibrated [%s] - Last update: %%Y-%%m-%%d %%H:%%M:%%S UTC",
+            speed_source);
+        char final_buf[100];
+        std::strftime(final_buf, sizeof(final_buf), time_buf, std::gmtime(&now_t));
+        last_calibration_time_str_ = final_buf;
     }
 
     if (first_calibration)
     {
         RCLCPP_INFO(this->get_logger(),
-            "CALIBRATED! Initial offset: %.2f° "
-            "(GPS heading=%.2f°, IMU compass=%.2f°, distance=%.3fm)",
-            new_offset, gps_heading_deg, imu_compass_deg, distance_m);
+            "CALIBRATED [%s]! Initial offset: %.2f° "
+            "(GPS heading=%.2f°, IMU compass=%.2f°, distance=%.3fm, speed=%.3fm/s)",
+            speed_source, new_offset,
+            gps_heading_deg, imu_compass_deg, distance_m, speed);
     }
     else
     {
         RCLCPP_DEBUG(this->get_logger(),
-            "Calibration updated: offset=%.2f° "
-            "(GPS=%.2f°, IMU=%.2f°, distance=%.3fm, speed=%.2fm/s)",
-            new_offset, gps_heading_deg, imu_compass_deg, distance_m, speed);
+            "Calibration updated [%s]: offset=%.2f° "
+            "(GPS=%.2f°, IMU=%.2f°, distance=%.3fm, speed=%.3fm/s)",
+            speed_source, calibration_offset_deg_.value(),
+            gps_heading_deg, imu_compass_deg, distance_m, speed);
     }
 
-    //--------------------------------------------------------------------------
-    // Advance GPS anchor — use current fix as the next starting point
-    //--------------------------------------------------------------------------
+    // Advance GPS anchor — use current fix as the next starting point.
     prev_gps_sample_ = {msg->latitude, msg->longitude, current_stamp};
 }
 
@@ -410,9 +511,7 @@ double ImuCompassNode::gps_bearing_deg(
     const double x = std::cos(lat1) * std::sin(lat2)
                    - std::sin(lat1) * std::cos(lat2) * std::cos(dlon);
 
-    const double bearing_rad = std::atan2(y, x);
-
-    return normalize_360(rad2deg(bearing_rad));
+    return normalize_360(rad2deg(std::atan2(y, x)));
 }
 
 double ImuCompassNode::haversine_distance_m(

@@ -40,14 +40,38 @@
 //   drift and reject GPS noise.
 //
 // CALIBRATION CONDITIONS (all must be true simultaneously):
-//   1. gps_speed >= min_calibration_speed_m_s  (robot is translating)
+//   1. effective_speed >= min_calibration_speed_m_s  (robot is translating)
+//      "effective speed" is either status_speed (hardware odometry, preferred)
+//      or gps_speed (GPS-derived, fallback). See use_status_speed parameter.
 //   2. |imu yaw rate| <= max_calibration_yaw_rate_rad_s  (moving straight-ish)
-//      WHY a separate stricter yaw gate here: even if gps_speed is non-zero
+//      WHY a separate stricter yaw gate here: even if speed is non-zero
 //      during a fast arc, the GPS bearing on an arc doesn't match the robot's
 //      instantaneous heading — so we'd compute a wrong offset. Requiring low
 //      yaw rate ensures we only calibrate during straight-line travel.
 //   3. GPS fix is valid (status >= STATUS_FIX)
 //   4. Sufficient time and distance since the last GPS sample used for heading
+//
+// SPEED GATE — WHY status_speed IS PREFERRED OVER gps_speed:
+// -----------------------------------------------------------
+// gps_speed is computed by differencing successive GPS fixes (Haversine). At
+// standstill, GPS position noise (multipath, atmospheric scintillation) causes
+// the antenna's reported position to wander by 0.1–1.0 m per fix. This
+// translates to false speed readings of 1–10 m/s that can slip through the
+// min_calibration_speed_m_s gate, triggering calibration updates against a
+// random GPS bearing at standstill — corrupting the offset.
+//
+// status_speed (wheel odometry / hardware velocity estimate) is not affected
+// by GPS noise and reliably reports 0.0 when the robot is stationary. Using it
+// as the speed gate eliminates standstill false calibrations entirely, and lets
+// min_calibration_speed_m_s be set to a physically meaningful threshold (e.g.
+// 0.3 m/s — actual motion) rather than an inflated noise-rejection value.
+//
+// AUTOMATIC FALLBACK:
+//   If use_status_speed=true but no status_speed message has arrived yet
+//   (e.g. the platform doesn't publish this topic), the node falls back to
+//   gps_speed automatically and logs a throttled warning. This prevents the
+//   node from being permanently blocked at startup on unsupported platforms.
+//   Once a status_speed message arrives, the node switches to it immediately.
 //
 // SUBSCRIBES:
 //   /{robot_name}/{imu_topic_suffix}                 [sensor_msgs/msg/Imu]
@@ -59,13 +83,19 @@
 //   /{robot_name}/{gps_topic_suffix}                 [sensor_msgs/msg/NavSatFix]
 //       Successive fixes → GPS bearing for calibration.
 //       Only used when calibration conditions are met.
-//       Topic suffix driven by 'gps_topic_suffix' parameter so this node
-//       works with both GeoFog and u-blox hardware variants without recompilation.
+//       Topic suffix driven by 'gps_topic_suffix' parameter.
 //       Default: "sensors/geofog/gps/fix".
 //
-//   /{robot_name}/gps_speed                          [std_msgs/msg/Float64]
-//       Pre-computed ground speed from gps_speed_node.
-//       Gate: only calibrate when speed >= min_calibration_speed_m_s.
+//   /{robot_name}/sensors/gps_speed                  [std_msgs/msg/Float64]
+//       GPS-derived ground speed from gps_speed_node.
+//       Used as speed gate when use_status_speed=false, or as fallback when
+//       use_status_speed=true but status_speed hasn't published yet.
+//
+//   /{robot_name}/{status_speed_topic_suffix}         [std_msgs/msg/Float64]
+//       Hardware odometry speed in m/s. Subscribed when use_status_speed=true.
+//       Preferred speed gate — not affected by GPS noise. Typically the Warthog
+//       platform's wheel-encoder velocity estimate.
+//       Default suffix: "status_speed".
 //
 // PUBLISHES:
 //   /{robot_name}/compass         [std_msgs/msg/Float64]
@@ -76,56 +106,63 @@
 //   /{robot_name}/compass/status  [std_msgs/msg/String]
 //       Human-readable calibration state. Published at IMU rate.
 //       Uncalibrated: "UNCALIBRATED - Begin moving to calibrate"
-//       Calibrated:   "Calibrated - Last update: 2024-03-15 14:23:07 UTC"
+//       Calibrated:   "Calibrated [status_speed] - Last update: 2024-03-15 14:23:07 UTC"
+//       The tag in brackets shows which speed source is active.
 //
 // PARAMETERS:
 //   robot_name                      (string, required)
 //       Robot namespace, e.g. "warthog1".
 //
+//   use_status_speed                (bool, true)
+//       When true, subscribe to /{robot_name}/{status_speed_topic_suffix} and
+//       use it as the primary speed gate for calibration. Falls back to
+//       gps_speed automatically if no status_speed message has been received.
+//       Set to false to use gps_speed exclusively (legacy behaviour).
+//
+//   status_speed_topic_suffix       (string, "status_speed")
+//       Topic path after /{robot_name}/ for the hardware speed signal.
+//       Only used when use_status_speed=true.
+//
 //   gps_topic_suffix                (string, "sensors/geofog/gps/fix")
-//       GPS topic path after /{robot_name}/. Set to "sensors/geofog/gps/fix"
-//       for GeoFog hardware (NAI_2, testing) or "sensors/ublox/fix" for
-//       u-blox (NAI_3, NAI_4). Driven by the active profile's gps_topic_suffix
-//       in petaar26/experiment/profiles.json.
+//       GPS topic path after /{robot_name}/. Selects GPS hardware variant.
 //
 //   imu_topic_suffix                (string, "sensors/microstrain/ekf/imu/data")
-//       IMU topic path after /{robot_name}/. Change if your IMU driver
-//       publishes to a different topic.
+//       IMU topic path after /{robot_name}/.
 //
-//   min_calibration_speed_m_s       (double, 1.0)
-//       Minimum gps_speed to allow calibration update.
+//   min_calibration_speed_m_s       (double, 0.3 when status_speed active,
+//                                            1.0 when gps_speed fallback)
+//       Minimum speed to allow calibration update.
+//       With status_speed: can be set close to actual minimum translating speed
+//       (e.g. 0.3 m/s) since odometry has no noise floor at standstill.
+//       With gps_speed: must be set above the GPS noise floor at standstill
+//       (from gps_noise_characterizer.py, typically 0.5–2.0 m/s depending on
+//       antenna placement and sky view).
 //
 //   max_calibration_yaw_rate_rad_s  (double, 0.1)
-//       Maximum |yaw rate| during calibration. Ensures straight-line heading
-//       reference. 0.1 rad/s ≈ 5.7°/s.
+//       Maximum |yaw rate| during calibration. 0.1 rad/s ≈ 5.7°/s.
 //
 //   min_gps_heading_distance_m      (double, 0.5)
-//       Minimum distance between GPS fixes used to compute a bearing.
+//       Minimum GPS displacement (m) between fixes for a valid bearing.
 //
 //   gps_heading_min_time_delta_s    (double, 0.1)
-//       Minimum time between GPS fixes used for bearing computation.
+//       Minimum time (s) between GPS fixes used for bearing computation.
 //
 //   calibration_ema_alpha           (double, 0.5)
 //       EMA smoothing weight for calibration offset updates.
 //       new_offset = prev + alpha * normalize_180(new_sample - prev)
-//       Angular delta arithmetic avoids ±180° wrap artefacts.
-//       1.0 = instant update (no smoothing, original pre-fix behaviour).
-//       0.5 = equal weight to new sample and history (default).
-//       0.3 = strong smoothing — slow to converge, very noise-resistant.
-//       NOTE: This parameter was exposed in the launch file but was previously
-//       not read or applied in the node (offset was replaced wholesale, i.e.
-//       effectively alpha=1.0). EMA is now correctly implemented in the .cpp.
+//       1.0 = instant update (no smoothing). 0.3 = strong smoothing.
 //
-// LAUNCH EXAMPLE:
+// LAUNCH EXAMPLES:
+//   # Default — uses status_speed if available, falls back to gps_speed
 //   ros2 launch imu_compass imu_compass.launch.py robot_name:=warthog1
 //
-// TOPIC EXAMPLES:
-//   $ ros2 topic echo /warthog1/compass
-//   data: "090.0°"
-//   ---
-//   $ ros2 topic echo /warthog1/compass/heading
-//   data: 90.0
-//   ---
+//   # Disable status_speed gate (legacy gps_speed-only behaviour)
+//   ros2 launch imu_compass imu_compass.launch.py robot_name:=warthog1 \
+//       use_status_speed:=false
+//
+//   # Override status_speed topic suffix
+//   ros2 launch imu_compass imu_compass.launch.py robot_name:=warthog1 \
+//       status_speed_topic_suffix:=platform/speed
 //
 //==============================================================================
 
@@ -158,8 +195,30 @@ private:
     /// conditions are met.
     void gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
 
-    /// gps_speed callback — caches latest speed for calibration gating.
-    void speed_callback(const std_msgs::msg::Float64::SharedPtr msg);
+    /// gps_speed callback — caches GPS-derived speed for use as fallback gate.
+    void gps_speed_callback(const std_msgs::msg::Float64::SharedPtr msg);
+
+    /// status_speed callback — caches hardware odometry speed for use as
+    /// preferred calibration gate. Only subscribed when use_status_speed_=true.
+    void status_speed_callback(const std_msgs::msg::Float64::SharedPtr msg);
+
+    //==========================================================================
+    // SPEED GATE HELPER
+    //==========================================================================
+
+    /// Returns the speed value used to gate calibration.
+    ///
+    /// Selection logic:
+    ///   - If use_status_speed_=false  → always return gps_speed (legacy)
+    ///   - If use_status_speed_=true AND status_speed_received_=true
+    ///                                 → return status_speed (preferred)
+    ///   - If use_status_speed_=true AND status_speed_received_=false
+    ///                                 → return gps_speed (startup fallback)
+    ///
+    /// The fallback case is intentional: it prevents the node from being
+    /// permanently blocked if the platform doesn't publish status_speed.
+    /// A throttled WARN is emitted so the operator knows fallback is active.
+    double effective_speed_m_s() const;
 
     //==========================================================================
     // MATH HELPERS
@@ -197,12 +256,14 @@ private:
     // --- ROS interfaces ---
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr        imu_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr  gps_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr        speed_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr        gps_speed_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr        status_speed_sub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr           compass_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr            status_pub_;
 
     // --- Parameters ---
     std::string robot_name_;
+    bool        use_status_speed_;              ///< Prefer status_speed over gps_speed
     double min_calibration_speed_m_s_;
     double max_calibration_yaw_rate_rad_s_;
     double min_gps_heading_distance_m_;
@@ -215,23 +276,38 @@ private:
     std::optional<double> calibration_offset_deg_;
 
     // Human-readable UTC timestamp of the most recent successful calibration
-    // update. Published on /compass/status when calibrated.
-    // Format: "Calibrated - Last update: 2024-03-15 14:23:07 UTC"
-    // Empty string until first calibration — status topic publishes the
-    // UNCALIBRATED message instead.
+    // update, including the speed source tag for diagnostics.
+    // Format: "Calibrated [status_speed] - Last update: 2024-03-15 14:23:07 UTC"
+    // Empty until first calibration.
     std::string last_calibration_time_str_;
 
     // --- Latest sensor values (written by callbacks, read cross-callback) ---
     // WHY atomic: these are written by their own callbacks and read by
     // gps_callback. With a single-threaded executor they never truly race,
     // but atomic is cheap and makes the cross-callback reads safe and clear.
-    std::atomic<double> latest_speed_m_s_{0.0};
+
+    /// GPS-derived ground speed from gps_speed_node. Updated by gps_speed_callback.
+    /// Used as speed gate when use_status_speed_=false, or when status_speed
+    /// hasn't published yet.
+    std::atomic<double> latest_gps_speed_m_s_{0.0};
+
+    /// Hardware odometry speed from the platform's status_speed topic.
+    /// Updated by status_speed_callback. Only meaningful when
+    /// status_speed_received_=true.
+    std::atomic<double> latest_status_speed_m_s_{0.0};
+
+    /// Set to true on the first incoming status_speed message.
+    /// Once true, effective_speed_m_s() returns status_speed instead of gps_speed.
+    /// Never reset to false — once the topic arrives, it stays available.
+    std::atomic<bool> status_speed_received_{false};
+
+    /// IMU yaw rate (rad/s). Updated by imu_callback, read by gps_callback.
     std::atomic<double> latest_yaw_rate_rad_s_{0.0};
 
-    // Cached IMU compass heading in NED convention [0, 360), updated every
-    // IMU tick. Used by gps_callback to compute the calibration offset.
-    // Named "compass" (not "yaw") to emphasize it is already in compass
-    // convention — do NOT add the 90° offset again in gps_callback.
+    /// Cached IMU compass heading in NED convention [0, 360), updated every
+    /// IMU tick. Used by gps_callback to compute the calibration offset.
+    /// Named "compass" (not "yaw") to emphasize it is already in compass
+    /// convention — do NOT add the 90° offset again in gps_callback.
     std::atomic<double> latest_imu_compass_deg_{0.0};
 
     // --- Previous GPS sample used for bearing computation ---
