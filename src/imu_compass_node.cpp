@@ -88,7 +88,7 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
     //--------------------------------------------------------------------------
     const std::string imu_topic          = "/" + robot_name_ + "/" + imu_topic_suffix;
     const std::string gps_topic          = "/" + robot_name_ + "/" + gps_topic_suffix;
-    const std::string gps_speed_topic    = "/" + robot_name_ + "/sensors/gps_speed";
+    const std::string gps_speed_topic    = "/" + robot_name_ + "/gps_speed";
     const std::string status_speed_topic = "/" + robot_name_ + "/" + status_speed_suffix;
     const std::string compass_topic      = "/" + robot_name_ + "/compass";
     const std::string status_topic       = "/" + robot_name_ + "/compass/status";

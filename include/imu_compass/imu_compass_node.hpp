@@ -86,7 +86,7 @@
 //       Topic suffix driven by 'gps_topic_suffix' parameter.
 //       Default: "sensors/geofog/gps/fix".
 //
-//   /{robot_name}/sensors/gps_speed                  [std_msgs/msg/Float64]
+//   /{robot_name}/gps_speed                          [std_msgs/msg/Float64]
 //       GPS-derived ground speed from gps_speed_node.
 //       Used as speed gate when use_status_speed=false, or as fallback when
 //       use_status_speed=true but status_speed hasn't published yet.
