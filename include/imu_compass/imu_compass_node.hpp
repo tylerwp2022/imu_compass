@@ -91,7 +91,7 @@
 //       Used as speed gate when use_status_speed=false, or as fallback when
 //       use_status_speed=true but status_speed hasn't published yet.
 //
-//   /{robot_name}/{status_speed_topic_suffix}         [std_msgs/msg/Float64]
+//   /{robot_name}/{status_speed_topic_suffix}         [std_msgs/msg/Float32]
 //       Hardware odometry speed in m/s. Subscribed when use_status_speed=true.
 //       Preferred speed gate — not affected by GPS noise. Typically the Warthog
 //       platform's wheel-encoder velocity estimate.
@@ -169,6 +169,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 
@@ -200,7 +201,8 @@ private:
 
     /// status_speed callback — caches hardware odometry speed for use as
     /// preferred calibration gate. Only subscribed when use_status_speed_=true.
-    void status_speed_callback(const std_msgs::msg::Float64::SharedPtr msg);
+    /// NOTE: status_speed publishes std_msgs/Float32, not Float64.
+    void status_speed_callback(const std_msgs::msg::Float32::SharedPtr msg);
 
     //==========================================================================
     // SPEED GATE HELPER
@@ -257,7 +259,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr        imu_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr  gps_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr        gps_speed_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr        status_speed_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr        status_speed_sub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr           compass_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr            status_pub_;
 

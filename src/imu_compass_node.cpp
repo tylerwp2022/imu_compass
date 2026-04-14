@@ -7,6 +7,7 @@
 #include "imu_compass/imu_compass_node.hpp"
 
 #include <sensor_msgs/msg/nav_sat_status.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -133,10 +134,10 @@ ImuCompassNode::ImuCompassNode(const rclcpp::NodeOptions & options)
         // publisher's QoS. If status_speed is published reliable, a
         // best-effort subscriber will still connect and receive all messages
         // on a lossless local network (loopback / shared memory).
-        status_speed_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+        status_speed_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             status_speed_topic,
             rclcpp::SensorDataQoS(),
-            [this](std_msgs::msg::Float64::SharedPtr msg) {
+            [this](std_msgs::msg::Float32::SharedPtr msg) {
                 this->status_speed_callback(msg);
             });
     }
@@ -224,7 +225,7 @@ void ImuCompassNode::gps_speed_callback(const std_msgs::msg::Float64::SharedPtr 
 // STATUS SPEED CALLBACK — cache hardware odometry speed
 //==============================================================================
 
-void ImuCompassNode::status_speed_callback(const std_msgs::msg::Float64::SharedPtr msg)
+void ImuCompassNode::status_speed_callback(const std_msgs::msg::Float32::SharedPtr msg)
 {
     const bool was_received = status_speed_received_.load();
 
